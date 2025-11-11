@@ -1,0 +1,32 @@
+Suba os containers:
+
+```sh
+docker compose up -d
+docker exec -it ollama ollama pull llama3
+
+```
+
+Dep do host para microfone:
+
+```sh
+sudo pacman -S ffmpeg
+```
+
+Crie a venv e instale o app
+```sh
+python -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+Ajustes(Opcional)
+```sh
+export OLLAMA_MODEL=llama3
+export LANG=pt
+```
+
+Rode
+```sh
+python main.py
+```
