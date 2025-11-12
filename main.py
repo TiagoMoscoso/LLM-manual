@@ -8,12 +8,12 @@ import wave
 import struct
 import signal
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QUrl 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QGridLayout, QHBoxLayout,
-    QLabel, QTextEdit, QPushButton, QMessageBox
+    QLabel, QTextEdit, QPushButton, QMessageBox, QProgressBar
 )
-
+from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 OLLAMA_URL   = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 STT_URL      = os.getenv("STT_URL",    "http://localhost:9000/inference")
 TTS_BASE     = (os.getenv("TTS_BASE") or os.getenv("TTS_URL") or "http://localhost:5000").rstrip("/")
@@ -22,7 +22,7 @@ LANG         = os.getenv("LANG", "pt")
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 AUTO_MANUAL_MD = os.path.join(APP_DIR, "manual.md")
-
+SUBJECT_NAME = os.getenv("SUBJECT_NAME", "Virtus").strip()
 MAX_ANSWER_CHARS = 600
 
 
@@ -205,12 +205,17 @@ class VoicePipelineWorker(QThread):
 
     def build_prompt(self, question: str) -> str:
         return (
-            "Você é um assistente que responde com base neste manual (markdown):\n"
+            "ATENÇÃO (INSTRUÇÕES OBRIGATÓRIAS) :\n"
+            f"- Responda SOMENTE se a pergunta for sobre {SUBJECT_NAME} e estritamente com base no manual abaixo.\n"
+            "- Se a pergunta não for sobre esse assunto ou não houver base suficiente no manual, responda exatamente:\n"
+            "\"Só posso responder sobre {subject} com base no manual fornecido. Reformule sua pergunta.\".\n"
+            "- Não invente, não cite fontes externas, não complemente com conhecimento geral.\n"
+            "- Seja curto e direto (português do Brasil).\n\n"
             "--- MANUAL ---\n"
             f"{self.manual_text}\n"
             "---------------\n\n"
-            f"Pergunta: {question}\n"
-            "Responda em português (BR), de forma curta e direta."
+            f"Pergunta do usuário: {question}\n"
+            "{subject} = " + SUBJECT_NAME
         )
 
     def run(self):
@@ -235,7 +240,7 @@ class VoicePipelineWorker(QThread):
 class Main(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Agente do Manual (Markdown) — não bloqueia UI")
+        self.setWindowTitle("Agente do Manual")
         self.resize(900, 700)
 
         self.manual_text = ""
@@ -275,8 +280,18 @@ class Main(QMainWindow):
         bbar.addWidget(self.save_tts_btn)
         grid.addLayout(bbar, row, 0, 1, 2)
         row += 1
+        self.audio_out = QAudioOutput(self)
+        self.audio_out.setVolume(1.0)  # 0.0–1.0
 
+        self.player = QMediaPlayer(self)
+        self.player.setAudioOutput(self.audio_out)
         self.setCentralWidget(root)
+        self.loading = QProgressBar()
+        self.loading.setRange(0, 0)              
+        self.loading.setTextVisible(False)       
+        self.loading.hide()
+        grid.addWidget(self.loading, row, 0, 1, 2)
+        row += 1
 
         self.ask_btn.clicked.connect(self.on_ask_text_async)
         self.rec_and_ask_btn.clicked.connect(self.on_record_and_ask_async)
@@ -284,11 +299,6 @@ class Main(QMainWindow):
 
         self.load_manual_md()
 
-    def set_busy(self, busy: bool):
-        self.ask_btn.setDisabled(busy)
-        self.rec_and_ask_btn.setDisabled(busy)
-        self.save_tts_btn.setDisabled(busy)
-        self.setCursor(Qt.CursorShape.BusyCursor if busy else Qt.CursorShape.ArrowCursor)
 
     def load_manual_md(self):
         try:
@@ -300,12 +310,36 @@ class Main(QMainWindow):
         except Exception as ex:
             self.manual_status.setText(f"Erro ao ler manual.md: {ex}")
 
+
+        
+    def set_busy(self, busy: bool):
+        self.ask_btn.setDisabled(busy)
+        self.rec_and_ask_btn.setDisabled(busy)
+        self.save_tts_btn.setDisabled(busy)
+
+        if busy:
+            self.loading.show()                       
+            self.setCursor(Qt.CursorShape.BusyCursor)
+            QApplication.processEvents()              
+        else:
+            self.loading.hide()                       
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
+
+
     def prompt_from_question(self, q: str) -> str:
         return (
-            "Você é um assistente que responde com base neste manual (markdown):\n"
-            f"{self.manual_text}\n\n"
-            f"Pergunta: {q}\n"
-            "Responda em português (BR), de forma curta e direta."
+            "ATENÇÃO (INSTRUÇÕES OBRIGATÓRIAS):\n"
+            f"- Responda SOMENTE se a pergunta for sobre {SUBJECT_NAME} e estritamente com base no manual abaixo.\n"
+            "- Se a pergunta não for sobre esse assunto ou não houver base suficiente no manual, responda exatamente:\n"
+            "\"Só posso responder sobre {subject} com base no manual fornecido. Reformule sua pergunta.\".\n"
+            "- Não invente, não cite fontes externas, não complemente com conhecimento geral.\n"
+            "- Seja curto e direto (português do Brasil).\n\n"
+            "--- MANUAL ---\n"
+            f"{self.manual_text}\n"
+            "---------------\n\n"
+            f"Pergunta do usuário: {q}\n"
+            "{subject} = " + SUBJECT_NAME
         )
 
     def on_ask_text_async(self):
@@ -359,7 +393,12 @@ class Main(QMainWindow):
 
     def _on_tts_ready(self, wav_path: str):
         self.last_audio_path = wav_path
-        open_with_system(wav_path)
+        try:
+            self.player.stop()  # garante restart limpo
+        except Exception:
+            pass
+        self.player.setSource(QUrl.fromLocalFile(wav_path))
+        self.player.play()
 
     def _on_worker_error(self, msg: str):
         self.set_busy(False)
