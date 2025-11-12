@@ -24,7 +24,31 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 AUTO_MANUAL_MD = os.path.join(APP_DIR, "manual.md")
 SUBJECT_NAME = os.getenv("SUBJECT_NAME", "Virtus").strip()
 MAX_ANSWER_CHARS = 600
+SYSTEM_PROMPT      = os.getenv("SYSTEM_PROMPT", "Responda APENAS em português (Brasil). Se a resposta não estiver inequívoca no manual, diga literalmente: \"Só posso responder sobre {subject} com base no manual fornecido. Reformule sua pergunta.\" Não invente. Seja sucinto.").strip()
+MAX_ANSWER_CHARS   = int(os.getenv("MAX_ANSWER_CHARS", "280"))
 
+OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "120"))
+OLLAMA_TEMP        = float(os.getenv("OLLAMA_TEMP", "0.2"))
+OLLAMA_TOP_P       = float(os.getenv("OLLAMA_TOP_P", "0.8"))
+OLLAMA_TOP_K       = int(os.getenv("OLLAMA_TOP_K", "40"))
+OLLAMA_REPEAT_PEN  = float(os.getenv("OLLAMA_REPEAT_PEN", "1.2"))
+OLLAMA_NUM_CTX     = int(os.getenv("OLLAMA_NUM_CTX", "2048"))
+OLLAMA_SEED        = int(os.getenv("OLLAMA_SEED", "42"))
+
+def build_base_prompt(manual: str, question: str) -> str:
+    return (
+        f"Sujeito: {SUBJECT_NAME}\n"
+        "Instruções:\n"
+        "- Responda SOMENTE se a pergunta for sobre o sujeito e baseada no manual.\n"
+        "- Se não houver base suficiente no manual, responda exatamente:\n"
+        "\"Só posso responder sobre {subject} com base no manual fornecido. Reformule sua pergunta.\"\n"
+        "- Seja direto e use pt-BR. Máx. 2 frases.\n\n"
+        "--- MANUAL ---\n"
+        f"{manual}\n"
+        "---------------\n\n"
+        f"Pergunta: {question}\n"
+        "{subject} = " + SUBJECT_NAME
+    )
 
 def which(cmd: str) -> bool:
     return shutil.which(cmd) is not None
@@ -36,15 +60,27 @@ def load_markdown(path: str) -> str:
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         return f.read()
 
-
-def call_ollama_generate(base_url: str, model: str, prompt: str, timeout=180) -> str:
+def call_ollama_generate(base_url: str, model: str, prompt: str, timeout=60) -> str:
     url = f"{base_url}/api/generate"
-    payload = {"model": model, "prompt": prompt, "stream": False}
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "system": SYSTEM_PROMPT.replace("{subject}", SUBJECT_NAME),
+        "stream": False,
+        "options": {
+            "num_predict": OLLAMA_NUM_PREDICT,
+            "temperature": OLLAMA_TEMP,
+            "top_p": OLLAMA_TOP_P,
+            "top_k": OLLAMA_TOP_K,
+            "repeat_penalty": OLLAMA_REPEAT_PEN,
+            "num_ctx": OLLAMA_NUM_CTX,
+            "seed": OLLAMA_SEED,
+        }
+    }
     r = requests.post(url, json=payload, timeout=timeout)
     r.raise_for_status()
     ans = r.json().get("response", "").strip()
     return ans[:MAX_ANSWER_CHARS] if MAX_ANSWER_CHARS > 0 else ans
-
 
 def call_stt_inference(stt_url: str, wav_path: str, language: str = LANG, timeout=180) -> str:
     with open(wav_path, "rb") as f:
@@ -204,20 +240,8 @@ class VoicePipelineWorker(QThread):
         self.manual_text = manual_text or ""
 
     def build_prompt(self, question: str) -> str:
-        return (
-            "ATENÇÃO (INSTRUÇÕES OBRIGATÓRIAS) :\n"
-            f"- Responda SOMENTE se a pergunta for sobre {SUBJECT_NAME} e estritamente com base no manual abaixo.\n"
-            "- Se a pergunta não for sobre esse assunto ou não houver base suficiente no manual, responda exatamente:\n"
-            "\"Só posso responder sobre {subject} com base no manual fornecido. Reformule sua pergunta.\".\n"
-            "- Não invente, não cite fontes externas, não complemente com conhecimento geral.\n"
-            "- Seja curto e direto (português do Brasil).\n\n"
-            "--- MANUAL ---\n"
-            f"{self.manual_text}\n"
-            "---------------\n\n"
-            f"Pergunta do usuário: {question}\n"
-            "{subject} = " + SUBJECT_NAME
-        )
-
+        return build_base_prompt(self.manual_text, question)
+    
     def run(self):
         fd, tmpwav = tempfile.mkstemp(prefix="ask_", suffix=".wav")
         os.close(fd)
@@ -328,19 +352,7 @@ class Main(QMainWindow):
 
 
     def prompt_from_question(self, q: str) -> str:
-        return (
-            "ATENÇÃO (INSTRUÇÕES OBRIGATÓRIAS):\n"
-            f"- Responda SOMENTE se a pergunta for sobre {SUBJECT_NAME} e estritamente com base no manual abaixo.\n"
-            "- Se a pergunta não for sobre esse assunto ou não houver base suficiente no manual, responda exatamente:\n"
-            "\"Só posso responder sobre {subject} com base no manual fornecido. Reformule sua pergunta.\".\n"
-            "- Não invente, não cite fontes externas, não complemente com conhecimento geral.\n"
-            "- Seja curto e direto (português do Brasil).\n\n"
-            "--- MANUAL ---\n"
-            f"{self.manual_text}\n"
-            "---------------\n\n"
-            f"Pergunta do usuário: {q}\n"
-            "{subject} = " + SUBJECT_NAME
-        )
+        return build_base_prompt(self.manual_text, q)
 
     def on_ask_text_async(self):
         q = self.question.toPlainText().strip()
