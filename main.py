@@ -23,16 +23,24 @@ LANG         = os.getenv("LANG", "pt")
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 AUTO_MANUAL_MD = os.path.join(APP_DIR, "manual.md")
 SUBJECT_NAME = os.getenv("SUBJECT_NAME", "Virtus").strip()
-MAX_ANSWER_CHARS = 600
-SYSTEM_PROMPT      = os.getenv("SYSTEM_PROMPT", "Responda APENAS em português (Brasil). Se a resposta não estiver inequívoca no manual, diga literalmente: \"Só posso responder sobre {subject} com base no manual fornecido. Reformule sua pergunta.\" Não invente. Seja sucinto.").strip()
-MAX_ANSWER_CHARS   = int(os.getenv("MAX_ANSWER_CHARS", "280"))
+MAX_ANSWER_CHARS = 20000
+SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", (
+    "Responda APENAS em português (Brasil), com texto simples e sem caracteres especiais, "
+    "sem emojis, sem aspas curvas, sem pontuação incomum e sem símbolos fora de A-Z, a-z, 0-9 e pontuação comum. "
+    "Use apenas letras e sinais normais. "
+    "Se a resposta não estiver inequívoca no manual, diga literalmente: "
+    "\"Só posso responder sobre {subject} com base no manual fornecido. Reformule sua pergunta.\" "
+    "Não invente. Seja direto e conciso."
+)).strip()
+APP_LANG = os.getenv("APP_LANG", "pt").split('.')[0].split('_')[0].lower()
+MAX_ANSWER_CHARS   = int(os.getenv("MAX_ANSWER_CHARS", "20000"))
 
-OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "120"))
+OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "20000"))
 OLLAMA_TEMP        = float(os.getenv("OLLAMA_TEMP", "0.2"))
 OLLAMA_TOP_P       = float(os.getenv("OLLAMA_TOP_P", "0.8"))
 OLLAMA_TOP_K       = int(os.getenv("OLLAMA_TOP_K", "40"))
 OLLAMA_REPEAT_PEN  = float(os.getenv("OLLAMA_REPEAT_PEN", "1.2"))
-OLLAMA_NUM_CTX     = int(os.getenv("OLLAMA_NUM_CTX", "2048"))
+OLLAMA_NUM_CTX     = int(os.getenv("OLLAMA_NUM_CTX", "4500"))
 OLLAMA_SEED        = int(os.getenv("OLLAMA_SEED", "42"))
 
 def build_base_prompt(manual: str, question: str) -> str:
@@ -42,7 +50,8 @@ def build_base_prompt(manual: str, question: str) -> str:
         "- Responda SOMENTE se a pergunta for sobre o sujeito e baseada no manual.\n"
         "- Se não houver base suficiente no manual, responda exatamente:\n"
         "\"Só posso responder sobre {subject} com base no manual fornecido. Reformule sua pergunta.\"\n"
-        "- Seja direto e use pt-BR. Máx. 2 frases.\n\n"
+        "- Use apenas texto simples, sem emojis, sem caracteres especiais e sem formatação.\n"
+        "- Seja curto, direto e em português do Brasil.\n\n"
         "--- MANUAL ---\n"
         f"{manual}\n"
         "---------------\n\n"
@@ -82,13 +91,14 @@ def call_ollama_generate(base_url: str, model: str, prompt: str, timeout=60) -> 
     ans = r.json().get("response", "").strip()
     return ans[:MAX_ANSWER_CHARS] if MAX_ANSWER_CHARS > 0 else ans
 
-def call_stt_inference(stt_url: str, wav_path: str, language: str = LANG, timeout=180) -> str:
+def call_stt_inference(stt_url: str, wav_path: str, language: str = APP_LANG, timeout=180) -> str:
     with open(wav_path, "rb") as f:
         files = {"file": ("audio.wav", f, "audio/wav")}
         data = {"language": language, "response_format": "text"}
         r = requests.post(stt_url, files=files, data=data, timeout=timeout)
     r.raise_for_status()
     return r.text.strip()
+
 
 
 def call_tts_any(tts_base: str, text: str, timeout=180) -> bytes:
@@ -230,10 +240,10 @@ class TTSWorker(QThread):
 
 
 class VoicePipelineWorker(QThread):
-    """Grava -> STT -> LLM (tudo em background)."""
     text_ready = pyqtSignal(str)
     answer_ready = pyqtSignal(str)
     error = pyqtSignal(str)
+    recording_stopped = pyqtSignal(float)  
 
     def __init__(self, manual_text: str, parent=None):
         super().__init__(parent)
@@ -241,24 +251,39 @@ class VoicePipelineWorker(QThread):
 
     def build_prompt(self, question: str) -> str:
         return build_base_prompt(self.manual_text, question)
-    
+
     def run(self):
         fd, tmpwav = tempfile.mkstemp(prefix="ask_", suffix=".wav")
         os.close(fd)
         try:
             record_wav_until_silence(tmpwav)
+
+            # duração gravada p/ log/status
+            try:
+                with wave.open(tmpwav, "rb") as wf:
+                    nframes = wf.getnframes()
+                    fr = wf.getframerate()
+                    dur = (nframes / float(fr)) if fr else 0.0
+            except Exception:
+                dur = 0.0
+            self.recording_stopped.emit(dur)
+
             text = call_stt_inference(STT_URL, tmpwav)
             if not text:
                 self.error.emit("Transcrição vazia.")
                 return
             self.text_ready.emit(text)
+
             ans = call_ollama_generate(OLLAMA_URL, OLLAMA_MODEL, self.build_prompt(text))
             self.answer_ready.emit(ans)
         except Exception as ex:
             self.error.emit(str(ex))
         finally:
-            try: os.remove(tmpwav)
-            except: pass
+            try:
+                os.remove(tmpwav)
+            except Exception:
+                pass
+
 
 
 class Main(QMainWindow):
@@ -266,6 +291,8 @@ class Main(QMainWindow):
         super().__init__()
         self.setWindowTitle("Agente do Manual")
         self.resize(900, 700)
+
+        self.statusBar()
 
         self.manual_text = ""
         self.last_answer = ""
@@ -379,16 +406,49 @@ class Main(QMainWindow):
         self.tts_worker.finished.connect(lambda: self.set_busy(False))
         self.tts_worker.start()
 
+    def _pause_tts_for_recording(self):
+        try:
+            self._saved_volume = self.audio_out.volume()
+        except Exception:
+            self._saved_volume = 1.0
+        self._tts_was_playing = (self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState)
+
+        try:
+            self.player.stop()
+        except Exception:
+            pass
+        try:
+            self.audio_out.setVolume(0.0)
+        except Exception:
+            pass
+
+    def _restore_tts_after_recording(self):
+        try:
+            self.audio_out.setVolume(self._saved_volume)
+        except Exception:
+            pass
+        self._tts_was_playing = False
+
     def on_record_and_ask_async(self):
         self.set_busy(True)
         self.answer.clear()
+        self._pause_tts_for_recording()
 
         self.voice_worker = VoicePipelineWorker(self.manual_text, parent=self)
         self.voice_worker.text_ready.connect(self._on_voice_text_ready)
         self.voice_worker.answer_ready.connect(self._on_voice_answer_then_tts)
         self.voice_worker.error.connect(self._on_worker_error)
-        self.voice_worker.finished.connect(lambda: None)  
+        self.voice_worker.recording_stopped.connect(self._on_recording_stopped) 
+        self.voice_worker.finished.connect(lambda: None)
         self.voice_worker.start()
+
+    def _on_recording_stopped(self, seconds: float):
+        msg = f"Gravação encerrada: {seconds:.2f}s"
+        print(msg)  
+        try:
+            self.statusBar().showMessage(msg, 3000)
+        except Exception:
+            pass
 
     def _on_voice_text_ready(self, text: str):
         self.question.setPlainText(text)
@@ -406,14 +466,17 @@ class Main(QMainWindow):
     def _on_tts_ready(self, wav_path: str):
         self.last_audio_path = wav_path
         try:
-            self.player.stop()  # garante restart limpo
+            self.player.stop()
         except Exception:
             pass
         self.player.setSource(QUrl.fromLocalFile(wav_path))
+
+        self._restore_tts_after_recording()
         self.player.play()
 
     def _on_worker_error(self, msg: str):
         self.set_busy(False)
+        self._restore_tts_after_recording()
         QMessageBox.critical(self, "Erro", msg)
 
     def on_save_tts(self):

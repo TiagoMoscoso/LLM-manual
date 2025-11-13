@@ -1,63 +1,53 @@
 version: "3.8"
 
 services:
-  # LLM local (Ollama)
   ollama:
     image: ollama/ollama:latest
     container_name: ollama
     restart: unless-stopped
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama:/root/.ollama
+    ports: ["11434:11434"]
+    volumes: ["ollama:/root/.ollama"]
     runtime: nvidia
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - OLLAMA_KEEP_ALIVE=24h
-      # Opcional: empurra mais camadas p/ GPU (ajuda em VRAM menor)
-      # - OLLAMA_NUM_GPU=100
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:11434/api/tags"]
       interval: 10s
       timeout: 5s
       retries: 15
 
-  # Whisper.cpp HTTP server (STT) - /inference na porta 9000
   stt:
     image: evilfreelancer/whisper-server:latest
     container_name: stt
     restart: unless-stopped
-    ports:
-      - "9000:9000"
+    ports: ["9000:9000"]
+    volumes: ["stt-models:/app/models"]
+    runtime: nvidia
     environment:
-      # modelos: tiny/base/small/medium/large-v3(-turbo)
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - WHISPER_MODEL=large-v3-turbo
       - WHISPER_MODEL_QUANTIZATION=q4_0
       - WHISPER_PROCESSORS=1
       - WHISPER_THREADS=6
-    volumes:
-      - stt-models:/app/models
     healthcheck:
-      # esse servidor nem sempre tem /health; usa timeout de conexão
-      test: ["CMD", "bash", "-lc", "timeout 1 bash -c '</dev/tcp/localhost/9000' || exit 1"]
+      test: ["CMD-SHELL", "timeout 1 sh -c '</dev/tcp/localhost/9000' || exit 1"]
       interval: 10s
       timeout: 3s
       retries: 20
       start_period: 15s
 
-  # Piper HTTP (TTS) - /tts na porta 5000 (voz pt-BR jeff/medium)
   tts:
     image: artibex/piper-http:latest
     container_name: tts
     restart: unless-stopped
-    ports:
-      - "5000:5000"
+    ports: ["5000:5000"]
     environment:
-      # Troque por outra voz pt-BR se quiser (ex.: cadu)
       - MODEL_DOWNLOAD_LINK=https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/jeff/medium/pt_BR-jeff-medium.onnx?download=true
     healthcheck:
-      test: ["CMD", "bash", "-lc", "curl -sf -X POST http://localhost:5000/tts -H 'Content-Type: application/json' -d '{\"text\":\"ok\"}' >/dev/null"]
+      test: ["CMD-SHELL", "curl -sf -X POST http://localhost:5000/tts -H 'Content-Type: application/json' -d '{\"text\":\"ok\"}' >/dev/null"]
       interval: 10s
       timeout: 5s
       retries: 15
